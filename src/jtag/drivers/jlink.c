@@ -77,6 +77,7 @@ static uint8_t usb_out_buffer[JLINK_OUT_BUFFER_SIZE];
 #define EMU_CMD_SET_SPEED		0x05
 #define EMU_CMD_GET_STATE		0x07
 #define EMU_CMD_SET_KS_POWER	0x08
+#define EMU_CMD_REGISTER		0x09
 #define EMU_CMD_GET_SPEEDS		0xc0
 #define EMU_CMD_GET_HW_INFO		0xc1
 #define EMU_CMD_GET_COUNTERS	0xc2
@@ -111,6 +112,10 @@ static uint8_t usb_out_buffer[JLINK_OUT_BUFFER_SIZE];
 #define EMU_CMD_MEASURE_RTCK_REACT	0xf6
 #define EMU_CMD_WRITE_MEM_ARM79		0xf7
 #define EMU_CMD_READ_MEM_ARM79		0xf8
+
+/* Register subcommands */
+#define REG_CMD_REGISTER		100
+#define REG_CMD_UNREGISTER		101
 
 /* bits return from EMU_CMD_GET_CAPS */
 #define EMU_CAP_RESERVED_1		0
@@ -190,17 +195,11 @@ static const char * const jlink_cap_str[] = {
 #define JLINK_HW_TYPE_FLASHER			2
 #define JLINK_HW_TYPE_JLINK_PRO			3
 #define JLINK_HW_TYPE_JLINK_LITE_ADI	5
-#define JLINK_HW_TYPE_MAX				6
+#define JLINK_HW_TYPE_JLINK_LITE_XMC4000	16
+#define JLINK_HW_TYPE_JLINK_LITE_XMC4200	17
+#define JLINK_HW_TYPE_LPCLINK2			18
 
-static const char * const jlink_hw_type_str[] = {
-	"J-Link",
-	"J-Trace",
-	"Flasher",
-	"J-Link Pro",
-	"Unknown",
-	"J-Link Lite-ADI",
-};
-
+/* Interface selection */
 #define JLINK_TIF_JTAG		0
 #define JLINK_TIF_SWD		1
 #define JLINK_SWD_DIR_IN	0
@@ -258,6 +257,8 @@ static struct jlink *jlink_handle;
 /* pid could be specified at runtime */
 static uint16_t vids[] = { 0x1366, 0x1366, 0x1366, 0x1366, 0x1366, 0 };
 static uint16_t pids[] = { 0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0 };
+
+static char *jlink_serial;
 
 static uint32_t jlink_caps;
 static uint32_t jlink_hw_type;
@@ -433,6 +434,41 @@ static int jlink_khz(int khz, int *jtag_speed)
 	return ERROR_OK;
 }
 
+static int jlink_register(void)
+{
+	int result;
+	usb_out_buffer[0] = EMU_CMD_REGISTER;
+	usb_out_buffer[1] = REG_CMD_REGISTER;
+	/* 2 - 11 is "additional parameter",
+	 * 12 - 13 is connection handle, zero initially */
+	memset(&usb_out_buffer[2], 0, 10 + 2);
+
+	result = jlink_usb_write(jlink_handle, 14);
+	if (result != 14) {
+		LOG_ERROR("J-Link register write failed (%d)", result);
+		return ERROR_JTAG_DEVICE_ERROR;
+	}
+
+	/* Returns:
+	 * 0 - 1 connection handle,
+	 * 2 - 3 number of information entities,
+	 * 4 - 5 size of a single information struct,
+	 * 6 - 7 number of additional bytes,
+	 * 8 - ... reply data
+	 *
+	 * Try to read the whole USB bulk packet
+	 */
+	result = jtag_libusb_bulk_read(jlink_handle->usb_handle, jlink_read_ep,
+				       (char *)usb_in_buffer, sizeof(usb_in_buffer),
+				       JLINK_USB_TIMEOUT);
+	if (!result) {
+		LOG_ERROR("J-Link register read failed (0 bytes received)");
+		return ERROR_JTAG_DEVICE_ERROR;
+	}
+
+	return ERROR_OK;
+}
+
 /*
  * select transport interface
  *
@@ -513,6 +549,10 @@ static int jlink_init(void)
 		jlink_get_status();
 	}
 
+	/* Registration is sometimes necessary for SWD to work */
+	if (jlink_caps & (1<<EMU_CAP_REGISTER))
+		jlink_register();
+
 	/*
 	 * Some versions of Segger's software do not select JTAG interface by default.
 	 *
@@ -545,12 +585,6 @@ static int jlink_init(void)
 			jlink_tap_append_step(1, 0);
 		jlink_tap_execute();
 	}
-
-	if (swd_mode)
-		jlink_swd_switch_seq(NULL, JTAG_TO_SWD);
-	else
-		jlink_swd_switch_seq(NULL, SWD_TO_JTAG);
-	jlink_swd_run_queue(NULL);
 
 	return ERROR_OK;
 }
@@ -926,10 +960,35 @@ static int jlink_get_version_info(void)
 
 		LOG_INFO("J-Link hw version %i", (int)jlink_hw_version);
 
-		if (jlink_hw_type >= JLINK_HW_TYPE_MAX)
-			LOG_INFO("J-Link hw type unknown 0x%" PRIx32, jlink_hw_type);
-		else
-			LOG_INFO("J-Link hw type %s", jlink_hw_type_str[jlink_hw_type]);
+		switch (jlink_hw_type) {
+			case JLINK_HW_TYPE_JLINK:
+				LOG_INFO("J-Link hw type J-Link");
+				break;
+			case JLINK_HW_TYPE_JTRACE:
+				LOG_INFO("J-Link hw type J-Trace");
+				break;
+			case JLINK_HW_TYPE_FLASHER:
+				LOG_INFO("J-Link hw type Flasher");
+				break;
+			case JLINK_HW_TYPE_JLINK_PRO:
+				LOG_INFO("J-Link hw type J-Link Pro");
+				break;
+			case JLINK_HW_TYPE_JLINK_LITE_ADI:
+				LOG_INFO("J-Link hw type J-Link Lite-ADI");
+				break;
+			case JLINK_HW_TYPE_JLINK_LITE_XMC4000:
+				LOG_INFO("J-Link hw type J-Link Lite-XMC4000");
+				break;
+			case JLINK_HW_TYPE_JLINK_LITE_XMC4200:
+				LOG_INFO("J-Link hw type J-Link Lite-XMC4200");
+				break;
+			case JLINK_HW_TYPE_LPCLINK2:
+				LOG_INFO("J-Link hw type J-Link on LPC-Link2");
+				break;
+			default:
+				LOG_INFO("J-Link hw type unknown 0x%" PRIx32, jlink_hw_type);
+				break;
+		}
 	}
 
 	if (jlink_caps & (1 << EMU_CAP_GET_MAX_BLOCK_SIZE)) {
@@ -966,6 +1025,19 @@ COMMAND_HANDLER(jlink_pid_command)
 	pids[0] = strtoul(CMD_ARGV[0], NULL, 16);
 	pids[1] = 0;
 	vids[1] = 0;
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(jlink_serial_command)
+{
+	if (CMD_ARGC != 1) {
+		LOG_ERROR("Need exactly one argument to jlink_serial");
+		return ERROR_FAIL;
+	}
+	if (jlink_serial)
+		free(jlink_serial);
+	jlink_serial = strdup(CMD_ARGV[0]);
 
 	return ERROR_OK;
 }
@@ -1285,6 +1357,12 @@ static const struct command_registration jlink_subcommand_handlers[] = {
 		.handler = &jlink_pid_command,
 		.mode = COMMAND_CONFIG,
 		.help = "set the pid of the interface we want to use",
+	},
+	{
+		.name = "serial",
+		.handler = &jlink_serial_command,
+		.mode = COMMAND_CONFIG,
+		.help = "set the serial number of the J-Link adapter we want to use"
 	},
 	COMMAND_REGISTRATION_DONE
 };
@@ -1620,9 +1698,9 @@ static int jlink_swd_run_queue(struct adiv5_dap *dap)
 		int ack = buf_get_u32(usb_in_buffer, pending_scan_results_buffer[i].first, 3);
 
 		if (ack != SWD_ACK_OK) {
-			LOG_ERROR("SWD ack not OK: %d %s", ack,
+			LOG_DEBUG("SWD ack not OK: %d %s", ack,
 				  ack == SWD_ACK_WAIT ? "WAIT" : ack == SWD_ACK_FAULT ? "FAULT" : "JUNK");
-			queued_retval = ack;
+			queued_retval = ack == SWD_ACK_WAIT ? ERROR_WAIT : ERROR_FAIL;
 			goto skip;
 		} else if (pending_scan_results_buffer[i].length) {
 			uint32_t data = buf_get_u32(usb_in_buffer, 3 + pending_scan_results_buffer[i].first, 32);
@@ -1695,7 +1773,7 @@ static void jlink_swd_queue_cmd(struct adiv5_dap *dap, uint8_t cmd, uint32_t *ds
 static struct jlink *jlink_usb_open()
 {
 	struct jtag_libusb_device_handle *devh;
-	if (jtag_libusb_open(vids, pids, NULL, &devh) != ERROR_OK)
+	if (jtag_libusb_open(vids, pids, jlink_serial, &devh) != ERROR_OK)
 		return NULL;
 
 	/* BE ***VERY CAREFUL*** ABOUT MAKING CHANGES IN THIS
@@ -1727,7 +1805,7 @@ static struct jlink *jlink_usb_open()
 	/* reopen jlink after usb_reset
 	 * on win32 this may take a second or two to re-enumerate */
 	int retval;
-	while ((retval = jtag_libusb_open(vids, pids, NULL, &devh)) != ERROR_OK) {
+	while ((retval = jtag_libusb_open(vids, pids, jlink_serial, &devh)) != ERROR_OK) {
 		usleep(1000);
 		timeout--;
 		if (!timeout)

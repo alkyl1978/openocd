@@ -1,9 +1,17 @@
 AC_PREREQ(2.64)
-AC_INIT([openocd], [0.9.0-dev],
+AC_INIT([openocd], [0.10.0-dev],
   [OpenOCD Mailing List <openocd-devel@lists.sourceforge.net>])
 AC_CONFIG_SRCDIR([src/openocd.c])
 
 m4_include([config_subdir.m4])dnl
+
+# check for makeinfo before calling AM_INIT_AUTOMAKE
+AC_CHECK_PROG([MAKEINFO], [makeinfo], [makeinfo])
+if test "x$MAKEINFO" = "x"; then
+  MAKEINFO='echo makeinfo missing; true'
+  AC_MSG_WARN([Info documentation will not be built.])
+fi
+AC_SUBST([MAKEINFO])
 
 AM_INIT_AUTOMAKE([-Wall -Wno-portability dist-bzip2 dist-zip subdir-objects])
 
@@ -614,6 +622,10 @@ case $host in
     AC_DEFINE([IS_DARWIN], [0], [0 if not building for Darwin.])
     ;;
 esac
+
+if test $is_win32 = yes; then
+    AC_DEFINE([WIN32_LEAN_AND_MEAN], [1], [1 to exclude old conflicting definitions when building on Windows])
+fi
 
 if test $build_parport = yes; then
   build_bitbang=yes
